@@ -1,0 +1,209 @@
+// ==UserScript==
+// @name         长江雨课堂 自动视频播放
+// @namespace    http://tampermonkey.net/
+// @version      2.3
+//@author        snaky
+// @description  视频播放完自动切下一个；支持答题页跳过；支持已看完/无进度文本的视频自动跳过
+// @match        *://changjiang.yuketang.cn/ai-workspace/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(() => {
+ 
+  const panel = document.createElement('div');
+  panel.style.cssText = `
+    position: fixed; right: 20px; bottom: 20px; width: 300px;
+    background: rgba(0,0,0,0.85); color: #00ff00;
+    font-family: monospace; font-size: 13px; padding: 12px;
+    border-radius: 8px; z-index: 9999999; pointer-events: none;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5); line-height: 1.5;
+  `;
+  panel.innerHTML = `<div style="color:#fff;font-weight:bold;margin-bottom:5px;">🤖 自动刷课助手 (v2.3)</div>
+                     <div id="log-status">初始化中...</div>`;
+  document.body.appendChild(panel);
+
+  function log(msg, color = '#00ff00') {
+    const time = new Date().toLocaleTimeString();
+    panel.innerHTML = `<div style="color:#fff;font-weight:bold;margin-bottom:5px;">🤖 自动刷课助手 (v2.3)</div>
+                       <div>[${time}]</div>
+                       <div style="color:${color}; word-break: break-all;">${msg}</div>`;
+    console.log(`[自动] ${msg}`);
+  }
+
+
+  const CONFIG = {
+    PROGRESS_KEYWORD: '完成度',
+    DONE_KEYWORD: '已完成',
+    NEXT_SELECTOR: '.unit-arrow.arrow-reverse',
+    PLAY_SELECTORS: [
+      '.xt_video_player_big_play_layer .xt_video_bit_play_btn',
+      '.xt_video_player_play_btn:not(.xt_video_player_play_btn_pause)',
+    ],
+    INTERVAL: 5000,
+    AFTER_NEXT_DELAY: 3000,
+    EMPTY_PAGE_DELAY: 5000,
+    MAX_NO_PROGRESS_COUNT: 3 // 连续3次(15秒)没进度文本且视频暂停，判定为卡死/已看完
+  };
+
+  let switching = false;
+  let progressEl = null;
+  let noProgressCount = 0; // 记录连续无进度文本的次数
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+
+  function findProgressEl() {
+    if (progressEl && document.contains(progressEl)) {
+      const t = (progressEl.textContent || '').replace(/\s/g, '');
+      if (t.includes(CONFIG.PROGRESS_KEYWORD) || t.includes(CONFIG.DONE_KEYWORD)) {
+        return progressEl;
+      }
+    }
+    const spans = document.querySelectorAll('span.text, span.el-tooltip.text');
+    for (const el of spans) {
+      if ((el.textContent || '').replace(/\s/g, '').includes(CONFIG.PROGRESS_KEYWORD)) {
+        progressEl = el;
+        return el;
+      }
+    }
+    return null;
+  }
+
+  function getProgress() {
+    const el = findProgressEl();
+    if (!el) return null;
+    const t = (el.textContent || '').replace(/\s/g, '');
+    if (t.includes(CONFIG.DONE_KEYWORD)) {
+      return { done: true, raw: '已完成' };
+    }
+    const m = t.match(/(\d+(?:\.\d+)?)%/);
+    if (m) {
+      const p = parseFloat(m[1]);
+      return { done: p >= 100, raw: `完成度：${p}%` };
+    }
+    return { done: false, raw: '读取中' };
+  }
+
+  function clickNext() {
+    const btn = document.querySelector(CONFIG.NEXT_SELECTOR);
+    if (!btn) return false;
+    btn.click();
+    return true;
+  }
+
+  async function clickPlay() {
+    const video = document.querySelector('video.xt_video_player, video');
+    if (video) {
+      try {
+        if (video.paused) {
+          await video.play();
+          log('✅ 已通过 video.play() 播放', '#00ff00');
+          return true;
+        }
+        log('视频已在播放中');
+        return true;
+      } catch (e) {
+        log(`video.play() 拦截: ${e.message}`, '#ffaa00');
+      }
+    }
+
+    for (const sel of CONFIG.PLAY_SELECTORS) {
+      const btn = document.querySelector(sel);
+      if (btn && btn.offsetParent !== null) {
+        btn.click();
+        log(`✅ 已点击播放按钮`, '#00ff00');
+        return true;
+      }
+    }
+    return false;
+  }
+
+
+  async function tick() {
+    if (switching) return;
+
+    let progress = getProgress();
+    const video = document.querySelector('video.xt_video_player, video');
+
+
+    if (!progress && video && video.duration > 0) {
+      if (video.ended || video.currentTime >= video.duration - 1) {
+        progress = { done: true, raw: '视频已播完（底层检测）' };
+      }
+    }
+
+    // --- 情况 A：无进度，且无视频（答题/考试页） ---
+    if (!progress && !video) {
+      noProgressCount = 0;
+      const nextBtn = document.querySelector(CONFIG.NEXT_SELECTOR);
+      if (nextBtn) {
+        switching = true;
+        log('📝 判定为答题/考试等非视频页，自动跳过', '#ffaa00');
+        if (clickNext()) {
+          log('✅ 已点击“下一个”跳过此页', '#00ff00');
+          await sleep(CONFIG.EMPTY_PAGE_DELAY);
+        } else {
+          log('❌ 找不到“下一个”按钮', '#ff4444');
+        }
+        switching = false;
+      }
+      return;
+    }
+
+    // --- 情况 B：无进度，但有视频（重点：处理已看完/卡死） ---
+    if (!progress && video) {
+      // 如果视频正在正常播放（没暂停，且没结束），说明可能文本没渲染出来，不强制打扰，继续等
+      if (!video.paused && !video.ended && video.readyState > 2) {
+        log('▶️ 视频正在播放中，但未找到进度文本...', '#ffaa00');
+        noProgressCount = 0;
+        return;
+      }
+
+      // 如果视频是暂停的，可能是卡死了，或者看完了但没触发 ended
+      noProgressCount++;
+      if (noProgressCount >= CONFIG.MAX_NO_PROGRESS_COUNT) {
+        // 【保险2：防假死】连续 15 秒没进度且暂停
+        log('⚠️ 视频无进度文本且长时间未播放，强制尝试下一个', '#ffaa00');
+        noProgressCount = 0;
+        progress = { done: true, raw: '强制跳过（防卡死）' };
+      } else {
+        log(`⏳ 未找到进度文本，视频暂停中... (${noProgressCount}/${CONFIG.MAX_NO_PROGRESS_COUNT})`, '#ffaa00');
+        return;
+      }
+    } else {
+      noProgressCount = 0; // 有文本或已进入下一步，重置计数
+    }
+
+    // --- 情况 C：有进度（DOM读取或视频实际播放完毕） ---
+    if (progress) {
+      log(`当前进度: ${progress.raw}`, '#00aaff');
+      if (!progress.done) return;
+
+      // 执行视频切换
+      switching = true;
+      log('🎉 准备切换下一个', '#ffff00');
+
+      try {
+        if (clickNext()) {
+          log('✅ 已点击“下一个”', '#00ff00');
+          await sleep(CONFIG.AFTER_NEXT_DELAY);
+          await clickPlay();
+          await sleep(2000);
+          const p = getProgress();
+          if (p) log(`切换完成，新进度: ${p.raw}`, '#00ff00');
+        } else {
+          log('❌ 没找到下一个按钮', '#ff4444');
+        }
+      } catch (e) {
+        log(`异常: ${e.message}`, '#ff4444');
+      } finally {
+        switching = false;
+      }
+    }
+  }
+
+  // 启动轮询
+  setInterval(tick, CONFIG.INTERVAL);
+  log('脚本已启动（v2.3），监控视频与答题页...', '#00ffff');
+})();
